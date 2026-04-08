@@ -1,0 +1,5 @@
+{
+  "name": "SkyPixel Animator",
+  "description": "Transform images into interactive drone-swarm animations inspired by SkyPixel tech.",
+  "requestFramePermissions": []
+}
