@@ -28,11 +28,24 @@ export default function SkyPixelEngine() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [image, setImage] = useState<HTMLImageElement | null>(null);
-  const particlesRef = useRef<Particle[]>([]);
+  
+  // High-performance Typed Arrays for particle data
+  const particlesData = useRef<{
+    x: Float32Array;
+    y: Float32Array;
+    targetX: Float32Array;
+    targetY: Float32Array;
+    originX: Float32Array;
+    originY: Float32Array;
+    vx: Float32Array;
+    vy: Float32Array;
+    colorGroups: { color: string; start: number; count: number }[];
+  } | null>(null);
+
   const [particleCount, setParticleCount] = useState(0);
   const [isAnimating, setIsAnimating] = useState(false);
   const [particleSize, setParticleSize] = useState(2);
-  const [resolution, setResolution] = useState(4);
+  const [resolution, setResolution] = useState(2);
   const [mouseRadius, setMouseRadius] = useState(120);
   const [force, setForce] = useState(8);
   const [speed, setSpeed] = useState(5);
@@ -57,17 +70,10 @@ export default function SkyPixelEngine() {
 
   useEffect(() => {
     // Map speed (1-10) to friction and ease
-    // Higher speed = higher ease, slightly lower friction (less drag)
     const newEase = 0.02 + (speed / 10) * 0.15;
     const newFriction = 0.85 + (speed / 10) * 0.12;
     setEase(newEase);
     setFriction(newFriction);
-    
-    // Update existing particles
-    particlesRef.current.forEach(p => {
-      p.ease = newEase;
-      p.friction = newFriction;
-    });
   }, [speed]);
 
   const initParticles = useCallback((img: HTMLImageElement) => {
@@ -103,12 +109,19 @@ export default function SkyPixelEngine() {
     offCtx.drawImage(img, 0, 0, drawWidth, drawHeight);
 
     const imageData = offCtx.getImageData(0, 0, drawWidth, drawHeight).data;
-    const newParticles: Particle[] = [];
+    
+    const MAX_PARTICLES = 40000;
+    let safeResolution = Math.max(resolution, 1);
+    
+    let estimatedCount = (drawWidth / safeResolution) * (drawHeight / safeResolution);
+    while (estimatedCount > MAX_PARTICLES) {
+      safeResolution += 0.5;
+      estimatedCount = (drawWidth / safeResolution) * (drawHeight / safeResolution);
+    }
 
+    const tempParticles: { x: number; y: number; tx: number; ty: number; color: string }[] = [];
     const offsetX = (width - drawWidth) / 2;
     const offsetY = (height - drawHeight) / 2;
-
-    const safeResolution = Math.max(resolution, 1);
 
     for (let y = 0; y < drawHeight; y += safeResolution) {
       for (let x = 0; x < drawWidth; x += safeResolution) {
@@ -119,28 +132,55 @@ export default function SkyPixelEngine() {
         const a = imageData[index + 3];
 
         if (a > 128) {
-          const color = `rgb(${r},${g},${b})`;
-          newParticles.push({
+          tempParticles.push({
             x: Math.random() * width,
             y: Math.random() * height,
-            targetX: x + offsetX,
-            targetY: y + offsetY,
-            originX: x + offsetX,
-            originY: y + offsetY,
-            color,
-            size: particleSize,
-            vx: 0,
-            vy: 0,
-            friction: friction,
-            ease: ease,
+            tx: x + offsetX,
+            ty: y + offsetY,
+            color: `rgb(${r},${g},${b})`
           });
         }
       }
     }
-    particlesRef.current = newParticles;
-    setParticleCount(newParticles.length);
+
+    // Sort by color for batching
+    tempParticles.sort((a, b) => a.color.localeCompare(b.color));
+
+    const count = tempParticles.length;
+    const data = {
+      x: new Float32Array(count),
+      y: new Float32Array(count),
+      targetX: new Float32Array(count),
+      targetY: new Float32Array(count),
+      originX: new Float32Array(count),
+      originY: new Float32Array(count),
+      vx: new Float32Array(count),
+      vy: new Float32Array(count),
+      colorGroups: [] as { color: string; start: number; count: number }[]
+    };
+
+    let currentGroup: { color: string; start: number; count: number } | null = null;
+
+    for (let i = 0; i < count; i++) {
+      const p = tempParticles[i];
+      data.x[i] = p.x;
+      data.y[i] = p.y;
+      data.targetX[i] = p.tx;
+      data.targetY[i] = p.ty;
+      data.originX[i] = p.tx;
+      data.originY[i] = p.ty;
+      
+      if (!currentGroup || currentGroup.color !== p.color) {
+        currentGroup = { color: p.color, start: i, count: 0 };
+        data.colorGroups.push(currentGroup);
+      }
+      currentGroup.count++;
+    }
+
+    particlesData.current = data;
+    setParticleCount(count);
     setIsAnimating(true);
-  }, [resolution, particleSize, friction, ease]);
+  }, [resolution, particleSize]);
 
   const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -180,7 +220,7 @@ export default function SkyPixelEngine() {
 
   const animate = useCallback(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!canvas || !particlesData.current) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
@@ -195,57 +235,81 @@ export default function SkyPixelEngine() {
       ctx.shadowBlur = 0;
     }
 
-    const currentParticles = particlesRef.current;
-    for (let i = 0; i < currentParticles.length; i++) {
-      const p = currentParticles[i];
-      
-      if (mouseRef.current.active) {
-        const dx = mouseRef.current.x - p.x;
-        const dy = mouseRef.current.y - p.y;
-        const distanceSq = dx * dx + dy * dy;
-        const radiusSq = mouseRadius * mouseRadius;
+    const data = particlesData.current;
+    const count = particleCount;
+    let anyParticleMoving = false;
+
+    const mx = mouseRef.current.x;
+    const my = mouseRef.current.y;
+    const mActive = mouseRef.current.active;
+    const rSq = mouseRadius * mouseRadius;
+
+    for (let i = 0; i < count; i++) {
+      let px = data.x[i];
+      let py = data.y[i];
+      let pvx = data.vx[i];
+      let pvy = data.vy[i];
+
+      if (mActive) {
+        const dx = mx - px;
+        const dy = my - py;
+        const distSq = dx * dx + dy * dy;
         
-        if (distanceSq < radiusSq) {
-          const distance = Math.sqrt(distanceSq);
+        if (distSq < rSq) {
+          const dist = Math.sqrt(distSq);
           const angle = Math.atan2(dy, dx);
-          const push = (mouseRadius - distance) / mouseRadius;
-          
-          // Apply repulsion force
-          p.vx -= Math.cos(angle) * push * force;
-          p.vy -= Math.sin(angle) * push * force;
+          const push = (mouseRadius - dist) / mouseRadius;
+          pvx -= Math.cos(angle) * push * force;
+          pvy -= Math.sin(angle) * push * force;
+          anyParticleMoving = true;
         }
       }
 
-      // Return to target position
-      const dx = p.targetX - p.x;
-      const dy = p.targetY - p.y;
+      const tdx = data.targetX[i] - px;
+      const tdy = data.targetY[i] - py;
       
-      p.vx += dx * p.ease;
-      p.vy += dy * p.ease;
+      pvx += tdx * ease;
+      pvy += tdy * ease;
+      pvx *= friction;
+      pvy *= friction;
       
-      p.vx *= p.friction;
-      p.vy *= p.friction;
-      
-      p.x += p.vx;
-      p.y += p.vy;
+      px += pvx;
+      py += pvy;
 
-      // Snap to target if very close to prevent "drifting" distortion
-      const snapThreshold = 0.5;
-      if (Math.abs(dx) < snapThreshold && Math.abs(dy) < snapThreshold && Math.abs(p.vx) < 0.1 && Math.abs(p.vy) < 0.1) {
-        p.x = p.targetX;
-        p.y = p.targetY;
-        p.vx = 0;
-        p.vy = 0;
+      if (Math.abs(pvx) > 0.01 || Math.abs(pvy) > 0.01) {
+        anyParticleMoving = true;
       }
 
-      ctx.fillStyle = p.color;
-      ctx.fillRect(p.x, p.y, p.size, p.size);
+      const snapThreshold = 0.5;
+      if (Math.abs(tdx) < snapThreshold && Math.abs(tdy) < snapThreshold && Math.abs(pvx) < 0.1 && Math.abs(pvy) < 0.1) {
+        px = data.targetX[i];
+        py = data.targetY[i];
+        pvx = 0;
+        pvy = 0;
+      }
+
+      data.x[i] = px;
+      data.y[i] = py;
+      data.vx[i] = pvx;
+      data.vy[i] = pvy;
+    }
+
+    // Batch rendering by color groups
+    for (const group of data.colorGroups) {
+      ctx.fillStyle = group.color;
+      for (let i = group.start; i < group.start + group.count; i++) {
+        ctx.fillRect(data.x[i], data.y[i], particleSize, particleSize);
+      }
     }
 
     if (isAnimating) {
-      requestRef.current = requestAnimationFrame(animate);
+      if (!anyParticleMoving && !mActive) {
+        setIsAnimating(false);
+      } else {
+        requestRef.current = requestAnimationFrame(animate);
+      }
     }
-  }, [isAnimating, mouseRadius, force, glow]);
+  }, [isAnimating, mouseRadius, force, glow, friction, ease, particleSize, particleCount]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -279,6 +343,7 @@ export default function SkyPixelEngine() {
 
   const handleMouseMove = (e: React.MouseEvent) => {
     mouseRef.current = { x: e.clientX, y: e.clientY, active: true };
+    if (!isAnimating) setIsAnimating(true);
   };
 
   const handleMouseLeave = () => {
@@ -358,18 +423,25 @@ export default function SkyPixelEngine() {
 
   const scatter = () => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
-    particlesRef.current.forEach(p => {
-      p.targetX = Math.random() * canvas.width;
-      p.targetY = Math.random() * canvas.height;
-    });
+    const data = particlesData.current;
+    if (!canvas || !data) return;
+    
+    for (let i = 0; i < particleCount; i++) {
+      data.targetX[i] = Math.random() * canvas.width;
+      data.targetY[i] = Math.random() * canvas.height;
+    }
+    setIsAnimating(true);
   };
 
   const restore = () => {
-    particlesRef.current.forEach(p => {
-      p.targetX = p.originX;
-      p.targetY = p.originY;
-    });
+    const data = particlesData.current;
+    if (!data) return;
+    
+    for (let i = 0; i < particleCount; i++) {
+      data.targetX[i] = data.originX[i];
+      data.targetY[i] = data.originY[i];
+    }
+    setIsAnimating(true);
   };
 
   return (
@@ -400,7 +472,7 @@ export default function SkyPixelEngine() {
           >
             <div className="flex items-center gap-2 md:gap-3">
               <div className="w-8 h-8 md:w-10 md:h-10 bg-primary/20 border border-primary/50 flex items-center justify-center rounded-sm">
-                <Cpu className="w-5 h-5 md:w-6 md:h-6 text-primary animate-pulse" />
+                <Cpu className="w-5 h-5 md:w-6 md:h-6 text-primary" />
               </div>
               <div>
                 <h1 className="text-2xl md:text-5xl font-black tracking-tighter text-white uppercase italic leading-none">
@@ -694,7 +766,6 @@ export default function SkyPixelEngine() {
                 </div>
                 <Card className="bg-white/[0.02] border-white/5 p-4 flex items-center gap-4 shadow-2xl border-t-white/10">
                   <div className="relative">
-                    <div className="w-2 h-2 rounded-full bg-primary animate-ping absolute inset-0" />
                     <div className="w-2 h-2 rounded-full bg-primary relative" />
                   </div>
                   <div className="flex flex-col">

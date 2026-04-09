@@ -1,5 +1,3 @@
-import { get, set, del } from 'idb-keyval';
-
 export interface SavedImage {
   id: string;
   name: string;
@@ -7,10 +5,7 @@ export interface SavedImage {
   timestamp: number;
 }
 
-const STORAGE_KEY = 'skypixel_saved_images';
-
 export async function saveImage(name: string, data: string): Promise<SavedImage> {
-  const images = await getSavedImages();
   const newImage: SavedImage = {
     id: crypto.randomUUID(),
     name,
@@ -18,16 +13,33 @@ export async function saveImage(name: string, data: string): Promise<SavedImage>
     timestamp: Date.now(),
   };
   
-  await set(STORAGE_KEY, [newImage, ...images]);
+  const response = await fetch("/api/images", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(newImage),
+  });
+
+  if (!response.ok) {
+    throw new Error("Failed to save image to database");
+  }
+
   return newImage;
 }
 
 export async function getSavedImages(): Promise<SavedImage[]> {
-  return (await get<SavedImage[]>(STORAGE_KEY)) || [];
+  const response = await fetch("/api/images");
+  if (!response.ok) {
+    return [];
+  }
+  return await response.json();
 }
 
 export async function deleteImage(id: string): Promise<void> {
-  const images = await getSavedImages();
-  const filtered = images.filter(img => img.id !== id);
-  await set(STORAGE_KEY, filtered);
+  const response = await fetch(`/api/images/${id}`, {
+    method: "DELETE",
+  });
+
+  if (!response.ok) {
+    throw new Error("Failed to delete image from database");
+  }
 }
