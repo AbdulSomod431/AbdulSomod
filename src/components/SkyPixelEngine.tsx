@@ -51,7 +51,7 @@ export default function SkyPixelEngine() {
   const [speed, setSpeed] = useState(5);
   const [friction, setFriction] = useState(0.92);
   const [ease, setEase] = useState(0.06);
-  const [glow, setGlow] = useState(true);
+  const [glow, setGlow] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isRecording, setIsRecording] = useState(false);
   const [recordProgress, setRecordProgress] = useState(0);
